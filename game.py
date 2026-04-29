@@ -1,11 +1,11 @@
 """
 game.py - Управление игровыми сессиями: матчмейкинг, поле, ходы, победа.
+Поле 8x8, фигуры, game_id привязан к каналу.
 """
 import asyncio
 import random
 from typing import Dict, Optional, List, Tuple
-from discord import Member, User
-import discord  # для бота внутри метода
+import discord
 
 SIZE = 8
 COLUMNS = [chr(ord('A') + i) for i in range(SIZE)]
@@ -17,7 +17,7 @@ EMPTY_CELL = "⬜"
 CLEANUP_DELAY = 60
 
 class Game:
-    def __init__(self, player1_id: int, player2_id: int, game_id: int):
+    def __init__(self, player1_id: int, player2_id: int, game_id: int, channel_id: int):
         self.game_id = game_id
         self.players = {player1_id, player2_id}
         available = list(PIECES)
@@ -27,9 +27,9 @@ class Game:
             [None for _ in range(SIZE)] for _ in range(SIZE)
         ]
         self.turn: int = player1_id
-        self.started = False
         self.winner: Optional[int] = None
         self.move_count = {player1_id: 0, player2_id: 0}
+        self.channel_id = channel_id
         self.cleanup_task: Optional[asyncio.Task] = None
 
     def cell_index(self, coord: str) -> Tuple[int, int]:
@@ -94,38 +94,31 @@ class Game:
             lines.append(f"`{r_idx+1}`" + "".join(row_cells))
         return "\n".join(lines)
 
-    def stats_message(self) -> str:
-        p1, p2 = list(self.players)
-        return (
-            f"Игрок {p1}: {self.move_count[p1]} клеток\n"
-            f"Игрок {p2}: {self.move_count[p2]} клеток"
-        )
 
 class GameManager:
     def __init__(self, db):
         self.queue: List[int] = []
-        self.active_games: Dict[int, Game] = {}
-        self.player_game: Dict[int, int] = {}
+        self.active_games: Dict[int, Game] = {}          # game_id -> Game
+        self.player_game: Dict[int, int] = {}            # user_id -> game_id
         self._game_id_counter = 0
         self.db = db
 
-    async def add_to_queue(self, user_id: int) -> str:
+    async def add_to_queue(self, user_id: int, channel_id: int) -> str:
         if user_id in self.player_game:
             return "Вы уже находитесь в игре."
         if user_id in self.queue:
-            return "Вы уже в очереди на поиск соперника."
+            return "Вы уже в очереди."
         self.queue.append(user_id)
         if len(self.queue) >= 2:
             p1 = self.queue.pop(0)
             p2 = self.queue.pop(0)
             self._game_id_counter += 1
-            game = Game(p1, p2, self._game_id_counter)
+            game = Game(p1, p2, self._game_id_counter, channel_id)
             self.active_games[game.game_id] = game
             self.player_game[p1] = game.game_id
             self.player_game[p2] = game.game_id
-            game.started = True
             asyncio.create_task(self._notify_game_start(game))
-            return "Соперник найден! Игра начинается."
+            return "Соперник найден! Игра начинается в этом канале."
         else:
             return "Вы в очереди. Ожидайте соперника..."
 
@@ -136,34 +129,38 @@ class GameManager:
         return "Вас нет в очереди."
 
     async def _notify_game_start(self, game: Game):
-        # здесь нужен доступ к боту; мы используем глобальный объект из main
-        from main import bot
+        # Отправляет начальное сообщение в канал с кнопками хода
+        from main import bot, GameView  # ленивый импорт
         for pid in game.players:
             user = bot.get_user(pid) or await bot.fetch_user(pid)
             if user:
                 embed = self._game_embed(game, pid)
                 try:
-                    await user.send(embed=embed)
+                    await user.send(f"Игра началась в канале <#{game.channel_id}>!")
                 except discord.Forbidden:
                     pass
+        channel = bot.get_channel(game.channel_id) or await bot.fetch_channel(game.channel_id)
+        if channel:
+            embed = self._game_embed(game, None)  # универсальный
+            view = GameView(game, self)
+            await channel.send(embed=embed, view=view)
 
-    def _game_embed(self, game: Game, user_id: int):
+    def _game_embed(self, game: Game, user_id: Optional[int] = None):
         embed = discord.Embed(
             title="🧮 Мультиплеерная тетрадь",
             description=game.render_board(),
             color=0xADD8E6
         )
-        piece = game.piece_of[user_id]
-        embed.add_field(name="Ваша фигура", value=piece, inline=True)
-        if game.winner is None:
-            turn_mention = f"<@{game.turn}>"
-            embed.add_field(name="Ход", value=turn_mention, inline=True)
-            embed.set_footer(text="Введите /ход координата (например A1)")
-        else:
+        if user_id:
+            piece = game.piece_of[user_id]
+            embed.add_field(name="Ваша фигура", value=piece, inline=True)
+        if game.winner is not None:
             embed.add_field(name="Победитель", value=f"<@{game.winner}>", inline=True)
+        else:
+            embed.add_field(name="Ходит", value=f"<@{game.turn}>", inline=True)
         return embed
 
-    async def make_move(self, user_id: int, coord: str):
+    async def make_move(self, user_id: int, coord: str) -> Tuple[str, Optional[Game]]:
         game_id = self.player_game.get(user_id)
         if game_id is None:
             return "Вы не в игре.", None
@@ -174,16 +171,13 @@ class GameManager:
             piece = game.place_piece(user_id, coord)
         except ValueError as e:
             return str(e), None
-        # Отправляем обновлённую доску обоим
-        from main import bot
-        for pid in game.players:
-            user = bot.get_user(pid) or await bot.fetch_user(pid)
-            if user:
-                embed = self._game_embed(game, pid)
-                try:
-                    await user.send(embed=embed)
-                except:
-                    pass
+        # Отправить обновлённую доску в канал
+        from main import bot, GameView
+        channel = bot.get_channel(game.channel_id) or await bot.fetch_channel(game.channel_id)
+        if channel:
+            embed = self._game_embed(game, None)
+            view = GameView(game, self)
+            await channel.send(embed=embed, view=view)
         if game.winner is not None:
             await self._end_game(game)
             return f"Вы поставили {piece} на {coord}. Вы победили!", None
